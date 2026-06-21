@@ -1,0 +1,20 @@
+[general]
+name=segTree
+description=Segmentador automatizado de nuvem de pontos tridimensionais (LiDAR/Fotogrametria) com foco em inventário florestal e individualização de copas de árvores urbanas, utilizando a API de geometria nativa do QGIS.
+about=O SegTree é uma ferramenta geoespacial desenvolvida para automatizar o mapeamento e o inventário da arborização urbana. O plugin processa dados altimétricos tridimensionais de alta densidade, aplicando um pipeline sequencial otimizado que inclui: ordenação geométrica pela componente Z, translação posicional dinâmica, filtragem estatística de ruídos por densidade de voxel e um laço computacional de agrupamento baseado em critérios de distância 3D e Casco Convexo (Convex Hull). Projetado para o ecossistema do QGIS, o SegTree substitui dependências espaciais externas por algoritmos nativos da API QgsGeometry, garantindo interoperabilidade, conformidade com padrões geoespaciais e alta performance na extração automatizada de copas individuais. Considere a instalação das dependências no terminal OSGeo4W: python -m pip install open3d numpy scipy
+category=Raster
+experimental=True
+deprecated=False
+icon=icon.png
+tags=Plugin, Segmentation, LiDAR, Tree, Forestry
+author=Lucas Jamiro Barbosa
+email=eng.lucasjb@outlook.com
+version=0.0.1
+qgisMinimumVersion=4.0
+qgisMaximumVersion=4.99
+
+homepage=https://github.com/englucasjb
+repository=https://github.com/englucasjb
+tracker=https://github.com/englucasjb
+
+changelog=Version 0.0.1: Initial public release generated with Plugin Builder Enterprise.
