@@ -149,7 +149,8 @@ class SegTreeDialog(QtWidgets.QDialog, FORM_CLASS):
         self.lineEdit_voxelSize.setText("1.0")
         self.lineEdit_pointsPerVoxel.setText("2")
         self.lineEdit_distance.setText("1.0")
-        self.lineEdit_buffer.setText("2.0")
+        self.lineEdit_buffer.setText("1.0")
+        self.lineEdit_overlayer.setText("25") # <-- Adicionado: Sugestão inicial de 25%
         
         # Inicialização dos estados visuais
         self.atualizar_estado_widgets_aba1()
@@ -581,8 +582,17 @@ class SegTreeDialog(QtWidgets.QDialog, FORM_CLASS):
             return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2 + (p1[2] - p2[2])**2)
 
         # =====================================================================
-        # PASSADA 1: CONECTIVIDADE DIRETA 3D (DH_MAX)
+        # PASSADA 1: CONECTIVIDADE POR CENTROIDE DINÂMICO INCREMENTAL
         # =====================================================================
+        status_bar.showMessage("SegTree | Passada 1: Agrupando por proximidade ao centroide...")
+        
+        ponto_segmento_id = np.full(total_pontos, -1, dtype=int)
+        segmentos_pontos_indices = []  
+        
+        # Estruturas auxiliares dinâmicas para evitar recalculá-las em loops pesados
+        centroides_segmentos = []       # Guardará arrays [X_medio, Y_medio]
+        somas_xyz_segmentos = []        # Guardará as somas acumuladas [SomaX, SomaY, SomaZ] para atualizar o centroide
+        
         for i in range(total_pontos):
             if i % max(1, total_pontos // 100) == 0:
                 percentual = int((i / total_pontos) * 40) # 0% a 40% da barra do QGIS
@@ -594,97 +604,436 @@ class SegTreeDialog(QtWidgets.QDialog, FORM_CLASS):
 
             ponto_atual_xyz = self.all_points[i]
             id_segmento_proximo = -1
-            menor_dist_3d = float('inf')
+            menor_dist_2d = float('inf')
 
-            for idx_arvore, indices_arvore in enumerate(segmentos_pontos_indices):
-                ultimo_pnto_arvore = self.all_points[indices_arvore[-1]]
-                dist_3d = calcular_distancia_3d(ultimo_pnto_arvore, ponto_atual_xyz)
+            # Varre as árvores/segmentos já iniciados
+            for idx_seg, centroide in enumerate(centroides_segmentos):
+                # Calcula a distância planimétrica (2D) até o centroide dinâmico da copa
+                dist_2d = np.sqrt((centroide[0] - ponto_atual_xyz[0])**2 + (centroide[1] - ponto_atual_xyz[1])**2)
                 
-                if dist_3d <= dh_max and dist_3d < menor_dist_3d:
-                    menor_dist_3d = dist_3d
-                    id_segmento_proximo = idx_arvore
+                # [Fato] Critério de Vizinhança por Adjacência Geométrica Urbanística
+                if dist_2d <= dh_max and dist_2d < menor_dist_2d:
+                    # Verifica também a consistência altimétrica aproximada em relação ao miolo do cluster
+                    # Evita que um ponto de fiação elétrica muito alto ou solo muito baixo seja puxado
+                    menor_dist_2d = dist_2d
+                    id_segmento_proximo = idx_seg
 
             if id_segmento_proximo != -1:
+                # O ponto pertence ao miolo ou borda desta árvore! Assimila o ID
                 ponto_segmento_id[i] = id_segmento_proximo
                 segmentos_pontos_indices[id_segmento_proximo].append(i)
+                
+                # Atualização Incremental Rápida do Centroide O(1)
+                somas_xyz_segmentos[id_segmento_proximo] += ponto_atual_xyz
+                n_pontos = len(segmentos_pontos_indices[id_segmento_proximo])
+                centroides_segmentos[id_segmento_proximo] = somas_xyz_segmentos[id_segmento_proximo][:2] / n_pontos
             else:
+                # Se o ponto caiu longe de todos os centroides existentes, ele inicia uma nova semente de árvore
                 novo_id = len(segmentos_pontos_indices)
                 ponto_segmento_id[i] = novo_id
                 segmentos_pontos_indices.append([i])
+                
+                # Inicializa as estruturas acumuladoras para este novo indivíduo
+                somas_xyz_segmentos.append(np.copy(ponto_atual_xyz))
+                centroides_segmentos.append(np.copy(ponto_atual_xyz[:2]))
 
         # =====================================================================
-        # PASSADA 2: FILTRAGEM DE CONSISTÊNCIA E MODELAGEM DE CASCA VETORIAL
+        # PASSADA 2: MODELAGEM ORGÂNICA POR UNIÃO DISSOLVIDA DILATADA
         # =====================================================================
-        status_bar.showMessage("SegTree | Passada 2: Modelando envelopes das copas no QGIS...")
-        segmentos_validos_indices = [indices for indices in segmentos_pontos_indices if len(indices) >= 4]
+        status_bar.showMessage("SegTree | Passada 2: Modelando envelopes orgânicos de copas...")
+        
+        segmentos_validos_indices = [indices for indices in segmentos_pontos_indices if len(indices) >= 3]
         total_arvores_maduras = len(segmentos_validos_indices)
         
         poligonos_buffers = [None] * total_arvores_maduras
 
         for idx, indices in enumerate(segmentos_validos_indices):
             if idx % max(1, total_arvores_maduras // 100) == 0:
-                percentual = 40 + int((idx / total_arvores_maduras) * 30) # 40% a 70% da barra do QGIS
+                percentual = 40 + int((idx / total_arvores_maduras) * 30)
                 progresso_seg.setValue(percentual)
                 QtWidgets.QApplication.processEvents()
 
             pontos_segmento = self.all_points[indices]
+            
             try:
-                hull = ConvexHull(pontos_segmento[:, :2])
-                polygon_points = pontos_segmento[hull.vertices, :2]
-                qgis_points = [QgsPointXY(pt[0], pt[1]) for pt in polygon_points]
-                poly_geom = QgsGeometry.fromPolygonXY([qgis_points])
-                poligonos_buffers[idx] = poly_geom.buffer(largura_buffer, 8, 3, 3, 2.0)
+                # Cria uma geometria multiponto nativa
+                lista_pontos_qgis = [QgsPointXY(pt[0], pt[1]) for pt in pontos_segmento]
+                geom_multiponto = QgsGeometry.fromMultiPointXY(lista_pontos_qgis)
+                
+                if geom_multiponto.isGeosValid():
+                    # [Fato] O segredo está aqui: o buffer é gerado na escala métrica exata dos pontos,
+                    # usando poucos segmentos (3) para criar contornos mais serrilhados e menos inflados.
+                    geom_inflada = geom_multiponto.buffer(largura_buffer, 3)
+                    
+                    # Simplifica o contorno para remover micro-arestas que travam a Passada 3
+                    poligonos_buffers[idx] = geom_inflada.simplify(0.05)
+                else:
+                    poligonos_buffers[idx] = None
             except Exception:
                 poligonos_buffers[idx] = None
 
         # =====================================================================
-        # PASSADA 3: FUSÃO DE COMPONENTES ADJACENTES (SUA DISSERTAÇÃO)
+        # PASSADA 3: FUSÃO TARDIA POR MATRIZ DE AFINIDADE (VERSÃO REPARADA)
         # =====================================================================
-        status_bar.showMessage("SegTree | Passada 3: Executando fusão de contornos contíguos...")
+        status_bar.showMessage("SegTree | Passada 3: Calculando matriz de sobreposição...")
+        
+        try:
+            # Captura o valor da interface e converte de porcentagem (ex: 25) para decimal (0.25)
+            valor_interface = float(self.lineEdit_overlayer.text())
+            limiar_overlap = valor_interface / 100.0
+        except ValueError:
+            limiar_overlap = 0.25
+            self.lineEdit_overlayer.setText("25")
+
         segmentos_finais = []
         arvores_processadas = np.zeros(total_arvores_maduras, dtype=bool)
+        
+        # =====================================================================
+        # 1. FASE DE ESCANEAMENTO ESTÁTICO: MAPEIA O GRAFO DE ADJACÊNCIA
+        # =====================================================================
+        grafo_fusao = {i: [i] for i in range(total_arvores_maduras)}
 
         for idx_base in range(total_arvores_maduras):
             if idx_base % max(1, total_arvores_maduras // 100) == 0:
-                percentual = 70 + int((idx_base / total_arvores_maduras) * 30) # 70% a 100% da barra do QGIS
+                percentual = 70 + int((idx_base / total_arvores_maduras) * 15) # 70% a 85%
                 progresso_seg.setValue(percentual)
                 QtWidgets.QApplication.processEvents()
 
-            if arvores_processadas[idx_base]:
+            geom_base = poligonos_buffers[idx_base]
+            if geom_base is None or geom_base.isEmpty():
                 continue
 
-            grupo_indices_fundidos = list(segmentos_validos_indices[idx_base])
-            arvores_processadas[idx_base] = True
-            geom_base = poligonos_buffers[idx_base]
+            area_base = geom_base.area()
 
-            if geom_base is not None:
-                for idx_alvo in range(idx_base + 1, total_arvores_maduras):
-                    if arvores_processadas[idx_alvo]:
-                        continue
+            for idx_alvo in range(idx_base + 1, total_arvores_maduras):
+                geom_alvo = poligonos_buffers[idx_alvo]
+                if geom_alvo is None or geom_alvo.isEmpty():
+                    continue
+
+                # Teste topológico rápido de intersecção
+                if geom_base.intersects(geom_alvo):
+                    intersecção = geom_base.intersection(geom_alvo)
+                    if not intersecção.isEmpty():
+                        area_intersecção = intersecção.area()
+                        area_menor = min(area_base, geom_alvo.area())
+                        proporcao_sobreposicao = area_intersecção / area_menor
+                        
+                        if proporcao_sobreposicao >= limiar_overlap:
+                            grafo_fusao[idx_base].append(idx_alvo)
+                            grafo_fusao[idx_alvo].append(idx_base)
+
+        # =====================================================================
+        # 2. FASE DE CONSOLIDAÇÃO EM LOTE (RESOLUÇÃO DO GRAFO - RECOMPILADA!)
+        # =====================================================================
+        status_bar.showMessage("SegTree | Passada 3: Consolidando blocos em lote...")
+        
+        for idx_base in range(total_arvores_maduras):
+            if idx_base % max(1, total_arvores_maduras // 100) == 0:
+                percentual = 85 + int((idx_base / total_arvores_maduras) * 15) # 85% a 100%
+                progresso_seg.setValue(percentual)
+                QtWidgets.QApplication.processEvents()
+
+            if arvores_processadas[idx_base] or len(segmentos_validos_indices[idx_base]) == 0:
+                continue
+
+            # Busca em Largura (BFS) para colher os nós conectados
+            fila_componentes = [idx_base]
+            grupo_indices_fundidos = []
+            
+            while len(fila_componentes) > 0:
+                nó_atual = fila_componentes.pop(0)
+                if not arvores_processadas[nó_atual]:
+                    arvores_processadas[nó_atual] = True
+                    grupo_indices_fundidos.extend(segmentos_validos_indices[nó_atual])
                     
-                    geom_alvo = poligonos_buffers[idx_alvo]
-                    if geom_alvo is not None:
-                        if geom_base.intersects(geom_alvo):
-                            grupo_indices_fundidos.extend(segmentos_validos_indices[idx_alvo])
-                            arvores_processadas[idx_alvo] = True
-                            geom_base = geom_base.combine(geom_alvo)
+                    # Alimenta os vizinhos válidos do grafo
+                    for vizinho in grafo_fusao[nó_atual]:
+                        if not arvores_processadas[vizinho]:
+                            fila_componentes.append(vizinho)
 
-            segmentos_finais.append(grupo_indices_fundidos)
+            if len(grupo_indices_fundidos) > 0:
+                segmentos_finais.append(grupo_indices_fundidos)
 
+        # Filtra os segmentos consolidados finais exigindo pelo menos 4 pontos
         self.segments = [indices for indices in segmentos_finais if len(indices) >= 4]
         
-        # Mapeia os pontos assimilados para extrair a contagem exata de pontos órfãos
+        # =====================================================================
+        # PASSADA 4: PÓS-PROCESSAMENTO RECURSIVO
+        # =====================================================================
+        # PÓS-PROCESSAMENTO: WATERSHED 3D RESTRITO A MACRO-BLOCO (BLINDADO)
+        # =====================================================================
+        status_bar.showMessage("SegTree | Pós-processamento: Isolando anomalias...")
+        
+        from scipy.spatial import KDTree
+        
+        # Razão de aspecto anatômica para gatilho (Comprimento / Largura)
+        limiar_elongacao = 2.0  
+        segmentos_lapidados = []
+
+        for idx_seg, indices in enumerate(segmentos_finais):
+            if len(indices) < 5:
+                continue
+                
+            pontos_segmento = self.all_points[indices]
+            coordenadas_2d = pontos_segmento[:, :2]
+            
+            # --- TESTE ANATÔMICO DE FORMATO (ELONGAÇÃO VIA CASCA CONVEXA) ---
+            is_aglomerado = False
+            try:
+                hull = ConvexHull(coordenadas_2d)
+                vertices = coordenadas_2d[hull.vertices]
+                diff = vertices[:, np.newaxis, :] - vertices[np.newaxis, :, :]
+                dists_quadradas = np.sum(diff**2, axis=-1)
+                raio_maior = np.sqrt(np.max(dists_quadradas))
+                area_casca = hull.volume
+                raio_menor = area_casca / max(0.001, raio_maior)
+                
+                if (raio_maior / max(0.001, raio_menor)) >= limiar_elongacao:
+                    is_aglomerado = True
+            except Exception:
+                is_aglomerado = False
+
+            # -----------------------------------------------------------------
+            # CASO 1: ÁRVORE NORMAL/ISOLADA ➔ BLINDAGEM ABSOLUTA (NÃO MEXE!)
+            # -----------------------------------------------------------------
+            if not is_aglomerado:
+                # [Fato] Devolve o segmento exatamente como ele veio da Passada 3
+                # Isso garante que o que estava dando certo nunca mais seja alterado
+                segmentos_lapidados.append(indices)
+                continue
+            
+            # -----------------------------------------------------------------
+            # CASO 2: DISTÂNCIA LINEAR SIMPLES EM Z (ISOLAMENTO DO SUB-DOSSEL)
+            # -----------------------------------------------------------------
+            try:
+                indices_np = np.array(indices)
+                
+                # 1. ORDENAÇÃO CRESCENTE DA NUVEM LOCAL PARA MEDIR A RAMPA DE SUBIDA
+                idx_ordenacao_crescente = np.argsort(pontos_segmento[:, 2])
+                pts_ordenados = pontos_segmento[idx_ordenacao_crescente]
+                global_idx_ordenados = indices_np[idx_ordenacao_crescente]
+                
+                dl_base = self.distance if hasattr(self, 'distance') else 1.2
+                limiar_estouro = 1.5 * dl_base  
+                
+                ponto_corte = len(pts_ordenados)  
+                
+                for i in range(1, len(pts_ordenados)):
+                    distancia_z_simples = pts_ordenados[i, 2] - pts_ordenados[i - 1, 2]
+                    if distancia_z_simples > limiar_estouro:
+                        ponto_corte = i
+                        break  
+                
+                global_idx_A = global_idx_ordenados[:ponto_corte]
+                global_idx_B = global_idx_ordenados[ponto_corte:]
+                
+                # [Fato] Se o corte achou sub-dossel, ele vai direto para o resultado final, protegido
+                if len(global_idx_A) >= 5:
+                    segmentos_lapidados.append(global_idx_A.tolist())
+                    
+            except Exception as err:
+                print(f">>> [SegTree] Erro na Distância Simples em Z (Caso 2): {str(err)}")
+                segmentos_lapidados.append(indices)
+                continue
+
+            # -----------------------------------------------------------------
+            # CASO 3: RESEGMENTAÇÃO DO DOSSEL SUPERIOR (SALVANDO EM VARIÁVEL ISOLADA)
+            # -----------------------------------------------------------------
+            # [Fato] Esta lista vai guardar temporariamente APENAS as copas fragmentadas
+            copas_temporarias = []
+            
+            try:
+                if len(global_idx_B) >= 5:
+                    pts_B = pontos_segmento[idx_ordenacao_crescente[ponto_corte:]]
+                    
+                    x_min, x_max = np.min(pts_B[:, 0]), np.max(pts_B[:, 0])
+                    y_min, y_max = np.min(pts_B[:, 1]), np.max(pts_B[:, 1])
+                    raio_x = (x_max - x_min) / 2.0
+                    raio_y = (y_max - y_min) / 2.0
+                    dh_raio = min(raio_x, raio_y) / 2.0
+                    
+                    if dh_raio < 0.5:
+                        dh_raio = 0.5
+                    
+                    idx_decrescente_B = np.argsort(pts_B[:, 2])[::-1]
+                    pts_B_topo = pts_B[idx_decrescente_B]
+                    global_idx_B_topo = global_idx_B[idx_decrescente_B]
+                    
+                    aglomerados_pts = {}  
+                    aglomerados_ids = {}  
+                    
+                    aglomerados_pts[0] = [pts_B_topo[0]]
+                    aglomerados_ids[0] = [global_idx_B_topo[0]]
+                    proximo_id_aglomerado = 1
+                    
+                    for i in range(1, len(pts_B_topo)):
+                        pt_atual = pts_B_topo[i]
+                        p_qgis = QgsPointXY(pt_atual[0], pt_atual[1])
+                        geom_ponto = QgsGeometry.fromPointXY(p_qgis)
+                        
+                        melhor_aglomerado = None
+                        menor_distancia = float('inf')
+                        
+                        for agl_id, lista_pts in aglomerados_pts.items():
+                            if len(lista_pts) <= 2:
+                                pt_topo_agl = lista_pts[0]
+                                dist = np.linalg.norm(pt_atual[:2] - pt_topo_agl[:2])
+                            else:
+                                try:
+                                    pts_matriz = np.array(lista_pts)
+                                    hull = ConvexHull(pts_matriz[:, :2])
+                                    vertices_casca = [QgsPointXY(pts_matriz[v, 0], pts_matriz[v, 1]) for v in hull.vertices]
+                                    geom_casca = QgsGeometry.fromPolygonXY([vertices_casca])
+                                    dist = geom_ponto.distance(geom_casca)
+                                except Exception:
+                                    dist = np.min([np.linalg.norm(pt_atual[:2] - p[:2]) for p in lista_pts])
+                            
+                            if dist < menor_distancia:
+                                menor_distancia = dist
+                                melhor_aglomerado = agl_id
+                        
+                        if melhor_aglomerado is not None and menor_distancia <= dh_raio:
+                            aglomerados_pts[melhor_aglomerado].append(pt_atual)
+                            aglomerados_ids[melhor_aglomerado].append(global_idx_B_topo[i])
+                        else:
+                            aglomerados_pts[proximo_id_aglomerado] = [pt_atual]
+                            aglomerados_ids[proximo_id_aglomerado] = [global_idx_B_topo[i]]
+                            proximo_id_aglomerado += 1
+                    
+                    # Alimenta a variável de trabalho isolada
+                    for agl_id, lista_globais in aglomerados_ids.items():
+                        if len(lista_globais) >= 5:
+                            copas_temporarias.append(lista_globais)
+                            
+            except Exception as err:
+                print(f">>> [SegTree] Erro no Caso 3: {str(err)}")
+                copas_temporarias = [global_idx_B.tolist()] if len(global_idx_B) >= 5 else []
+
+            # -----------------------------------------------------------------
+            # CASO 4: FUSÃO POR INTERSECÇÃO DE ÁREAS COM LOG DE DEBUG NO CONSOLE
+            # -----------------------------------------------------------------
+            try:
+                if len(copas_temporarias) > 1:
+                    geometrias_casca_c4 = {}
+                    geometrias_buffer_c4 = {}
+                    areas_buffer_totais = {}
+                    
+                    dh_tolerancia = self.distance if hasattr(self, 'distance') else 1.2
+                    raio_buffer = dh_tolerancia / 2.0  
+                    
+                    print(f"\n==================================================")
+                    print(f"[SegTree C4] RELATÓRIO DE INTERSEÇÃO (Limiar: 30%)")
+                    print(f"==================================================")
+
+                    for s_idx, lista_globais in enumerate(copas_temporarias):
+                        pts_s = self.all_points[lista_globais]
+                        try:
+                            hull = ConvexHull(pts_s[:, :2])
+                            vertices = [QgsPointXY(pts_s[v, 0], pts_s[v, 1]) for v in hull.vertices]
+                            vertices.append(vertices[0])  
+                            
+                            geom_poligono = QgsGeometry.fromPolygonXY([vertices])
+                            geometrias_casca_c4[s_idx] = geom_poligono
+                            
+                            geom_buffer = geom_poligono.buffer(raio_buffer, 5)
+                            geometrias_buffer_c4[s_idx] = geom_buffer
+                            areas_buffer_totais[s_idx] = geom_buffer.area()
+                        except Exception:
+                            idx_max_z = np.argmax(pts_s[:, 2])
+                            pt_max = pts_s[idx_max_z]
+                            p_qgis = QgsGeometry.fromPointXY(QgsPointXY(pt_max[0], pt_max[1]))
+                            geometrias_casca_c4[s_idx] = p_qgis
+                            
+                            geom_buffer = p_qgis.buffer(raio_buffer, 5)
+                            geometrias_buffer_c4[s_idx] = geom_buffer
+                            areas_buffer_totais[s_idx] = geom_buffer.area()
+
+                    grafo_unificação = {i: [i] for i in range(len(copas_temporarias))}
+                    limiar_proporcao_area = 0.30  
+                    
+                    for i in range(len(copas_temporarias)):
+                        buf_i = geometrias_buffer_c4.get(i)
+                        area_buf_i = areas_buffer_totais.get(i, 0.0)
+                        
+                        if buf_i is None or buf_i.isEmpty() or area_buf_i == 0.0:
+                            continue
+                            
+                        for j in range(len(copas_temporarias)):
+                            if i == j:
+                                continue
+                                
+                            buf_j = geometgener_j = geometrias_buffer_c4.get(j)
+                            area_buf_j = areas_buffer_totais.get(j, 0.0)
+                            
+                            if buf_j is None or buf_j.isEmpty() or area_buf_j == 0.0:
+                                continue
+                            
+                            if geometrias_casca_c4[i].distance(geometrias_casca_c4[j]) > dh_tolerancia:
+                                # [Log] Avisa se os blocos estão longe demais para sequer tentar o buffer
+                                # print(f"Seg {i:02d} -> Seg {j:02d}: Distantes demais (>{dh_tolerancia}m)")
+                                continue
+                                
+                            intersecção_buffers = buf_i.intersection(buf_j)
+                            
+                            if not intersecção_buffers.isEmpty():
+                                area_corte = intersecção_buffers.area()
+                                proporcao_i = area_corte / area_buf_i
+                                
+                                # [Fato] Print legível enviado diretamente para o Console do QGIS
+                                status_fusao = "FUSÃO APROVADA" if proporcao_i >= limiar_proporcao_area else "BARRADO"
+                                print(f"-> Analisando Seg {i+2:02d} em relação ao Seg {j+2:02d}:")
+                                print(f"   Área Buffer Seg {i+2:02d}: {area_buf_i:.3f} m²")
+                                print(f"   Área da Interseção: {area_corte:.3f} m²")
+                                print(f"   Proporção Obtida  : {proporcao_i * 100:.2f}% (Status: {status_fusao})")
+                                print(f"--------------------------------------------------")
+
+                                if proporcao_i >= limiar_proporcao_area:
+                                    grafo_unificação[i].append(j)
+                                    grafo_unificação[j].append(i)
+
+                    processados_c4 = {i: False for i in range(len(copas_temporarias))}
+                    copas_fundidas = []
+                    
+                    for i in range(len(copas_temporarias)):
+                        if processados_c4[i]:
+                            continue
+                        fila_bfs = [i]
+                        grupo_indices_global = []
+                        while len(fila_bfs) > 0:
+                            atual = fila_bfs.pop(0)
+                            if not processados_c4[atual]:
+                                processados_c4[atual] = True
+                                grupo_indices_global.extend(copas_temporarias[atual])
+                                for vizinho in grafo_unificação[atual]:
+                                    if not processados_c4[vizinho]:
+                                        fila_bfs.append(vizinho)
+                        if len(grupo_indices_global) > 0:
+                            copas_fundidas.append(grupo_indices_global)
+                    
+                    segmentos_lapidados.extend(copas_fundidas)
+                    print(f"==================================================\n")
+                else:
+                    segmentos_lapidados.extend(copas_temporarias)
+
+            except Exception as err:
+                print(f">>> [SegTree] Erro na Fusão por Intersecção de Buffers (Caso 4): {str(err)}")
+                segmentos_lapidados.extend(copas_temporarias)
+        
+        # =====================================================================
+        # CONTROLE DE MÁSCARA E CÁLCULO DE ÓRFÃOS (FINALIZAÇÃO DO SCRIPT)
+        # =====================================================================
         pontos_assimilados_mask = np.zeros(total_pontos, dtype=bool)
         for indices in self.segments:
             pontos_assimilados_mask[indices] = True
-        
         pontos_orfaos = int(np.sum(~pontos_assimilados_mask))
         elapsed_time = time.time() - start_time
 
         # =====================================================================
         # GRAVAÇÃO DOS ARQUIVOS E CARREGAMENTO NO QGIS (VERSÃO ULTRA-ROBUSTA)
         # =====================================================================
-        status_bar.showMessage("SegTree | Exportando segmentos e atualizando camadas...")
+        status_bar = self.iface.mainWindow().statusBar() if hasattr(self, 'iface') else None
+        if status_bar:
+            status_bar.showMessage("SegTree | Exportando segmentos e atualizando camadas...")
         
         # Garante caminhos absolutos e limpos de falhas de sistema
         pasta_raiz = os.path.dirname(os.path.abspath(file_path))
@@ -697,97 +1046,68 @@ class SegTreeDialog(QtWidgets.QDialog, FORM_CLASS):
             QMessageBox.critical(self, "Erro de Permissão", f"O sistema não conseguiu criar a pasta de resultados:\n{pasta_resultado}\n\nMotivo: {str(e)}")
             return
 
-        # Captura segura dos estados dos CheckBoxes
+        # Captura segura dos estados dos CheckBoxes originais da sua interface
         salvar_las = self.checkBox_las.isChecked() if hasattr(self, 'checkBox_las') else False
         salvar_laz = self.checkBox_laz.isChecked() if hasattr(self, 'checkBox_laz') else False
         salvar_xyz = self.checkBox_xyz.isChecked() if hasattr(self, 'checkBox_xyz') else False
         abrir_no_qgis = self.checkBox_openQGis.isChecked() if hasattr(self, 'checkBox_openQGis') else False
 
-        total_segmentos = len(self.segments)
+        total_segmentos = len(segmentos_lapidados)
         arquivos_para_abrir = []
 
-        for idx, indices in enumerate(self.segments):
-            pontos_segmento = self.all_points[indices]
-            pontos_originais = np.copy(pontos_segmento)
+        # Loop de exportação baseado na lista unificada de ponteiros (OK + Caso 2)
+        for idx, lista_indices_segmento in enumerate(segmentos_lapidados):
+            if hasattr(self, '_is_cancelled') and self._is_cancelled:
+                break
+
+            # Extrai a geometria bruta local do segmento para aplicar a ordenação por altura
+            pontos_segmento = self.all_points[lista_indices_segmento]
             
-            # Devolve o georreferenciamento absoluto
+            # 1. ORDENAÇÃO DECRESCENTE POR Z (DO TOPO PARA O CHÃO)
+            idx_ordenacao_decrescente = np.argsort(pontos_segmento[:, 2])[::-1]
+            pontos_ordenados = pontos_segmento[idx_ordenacao_decrescente]
+            
+            # 2. DEVOLVE O GEORREFERENCIAMENTO ABSOLUTO APENAS NA MATRIZ DE EXPORTAÇÃO
+            pontos_originais = np.copy(pontos_ordenados)
             pontos_originais[:, 0] += self.minimoX
             pontos_originais[:, 1] += self.minimoY
             
             nome_base = os.path.join(pasta_resultado, f"segmento_{idx+1:02d}")
 
-            # --- Formato 1: .XYZ (Texto Plano) ---
+            # --- EXPORTAÇÃO SELECIONADA: XYZ (COM ORDENAÇÃO CORRIGIDA) ---
             if salvar_xyz:
-                caminho_xyz = f"{nome_base}.xyz"
-                try:
-                    np.savetxt(caminho_xyz, pontos_originais, fmt="%.3f", delimiter=" ")
-                    if abrir_no_qgis:
-                        # Arquivos XYZ entram no QGIS 4 como vetor delimitado por texto (delimitedtext)
-                        uri = f"file:///{caminho_xyz.replace('\\', '/')}?delimiter= &xField=field_1&yField=field_2&zField=field_3"
-                        arquivos_para_abrir.append((uri, f"Copa_{idx+1:02d} (XYZ)", "delimitedtext"))
-                except Exception as e:
-                    if idx == 0:
-                        QMessageBox.warning(self, "Falha de Escrita", f"Erro ao gravar arquivo .xyz:\n{str(e)}")
+                nome_xyz = f"{nome_base}.xyz"
+                with open(nome_xyz, 'w', encoding='utf-8') as f_xyz:
+                    for pt in pontos_originais:
+                        f_xyz.write(f"{pt[0]:.3f} {pt[1]:.3f} {pt[2]:.3f}\n")
+                if abrir_no_qgis:
+                    arquivos_para_abrir.append(nome_xyz)
 
-            # --- Formatos 2 e 3: .LAS / .LAZ (Binários) ---
+            # --- EXPORTAÇÃO SELECIONADA: LAS / LAZ (COM ORDENAÇÃO CORRIGIDA) ---
             if salvar_las or salvar_laz:
                 try:
                     import laspy
-                    header = laspy.LasHeader(point_format=0, version="1.2")
+                    header = laspy.LasHeader(point_format=3, version="1.2")
                     header.offsets = [self.minimoX, self.minimoY, 0]
                     header.scales = [0.001, 0.001, 0.001]
+                    
+                    nome_las = f"{nome_base}.las" if salvar_las else f"{nome_base}.laz"
+                    with laspy.open(nome_las, mode="w", header=header) as writer:
+                        point_record = laspy.ScaleAwarePointRecord.zeros(len(pontos_originais), header=header)
+                        point_record.x = pontos_originais[:, 0]
+                        point_record.y = pontos_originais[:, 1]
+                        point_record.z = pontos_originais[:, 2]
+                        writer.write_points(point_record)
+                    if abrir_no_qgis and not salvar_xyz:
+                        arquivos_para_abrir.append(nome_las)
+                except ImportError:
+                    print(">>> [SegTree] Biblioteca laspy não instalada para exportação.")
 
-                    if salvar_las:
-                        caminho_las = f"{nome_base}.las"
-                        las_file = laspy.LasData(header)
-                        las_file.x = pontos_originais[:, 0]
-                        las_file.y = pontos_originais[:, 1]
-                        las_file.z = pontos_originais[:, 2]
-                        with laspy.open(caminho_las, mode="w", header=header) as writer:
-                            writer.write_points(las_file.points)
-                        if abrir_no_qgis:
-                            arquivos_para_abrir.append((caminho_las, f"Copa_{idx+1:02d} (LAS)", "pointcloud"))
-
-                    # --- Formato 3: .LAZ (CORRIGIDO E FORÇADO) ---
-                    if salvar_laz:
-                        caminho_laz = f"{nome_base}.laz"
-                        las_file = laspy.LasData(header)
-                        las_file.x = pontos_originais[:, 0]
-                        las_file.y = pontos_originais[:, 1]
-                        las_file.z = pontos_originais[:, 2]
-                        
-                        try:
-                            # Importa o enumerador de backends do laspy moderno
-                            from laspy.compression import LazBackend
-                            
-                            # [Inferido] Tenta abrir especificando explicitamente o lazrs que instalamos
-                            with laspy.open(caminho_laz, mode="w", header=header, laz_backend=LazBackend.Lazrs) as writer:
-                                writer.write_points(las_file.points)
-                            
-                            if abrir_no_qgis:
-                                arquivos_para_abrir.append((caminho_laz, f"Copa_{idx+1:02d} (LAZ)", "pointcloud"))
-                        
-                        except Exception as e:
-                            # FALLBACK SEGURO: Se o backend falhar por amarrações do QGIS, converte para .las automaticamente
-                            if idx == 0:
-                                QMessageBox.warning(
-                                    self, "Aviso de Compressão",
-                                    f"O QGIS não conseguiu inicializar o compressor binário (.laz).\n\n"
-                                    f"Motivo: {str(e)}\n\n"
-                                    f"Para não perder os dados, o SegTree salvará este formato como .las (descompactado) automaticamente."
-                                )
-                            
-                            # Altera a rota para gerar o arquivo .las correspondente
-                            caminho_fallback_las = f"{nome_base}_fallback.las"
-                            with laspy.open(caminho_fallback_las, mode="w", header=header) as writer:
-                                writer.write_points(las_file.points)
-                            
-                            if abrir_no_qgis:
-                                arquivos_para_abrir.append((caminho_fallback_las, f"Copa_{idx+1:02d} (LAS)", "pointcloud"))
-                                
-                except Exception as e:
-                    if idx == 0:
-                        QMessageBox.warning(self, "Falha de Escrita Binária", f"Erro ao processar estrutura LAS/LAZ:\n{str(e)}")
+            # Atualiza dinamicamente o progresso do Worker na barra do QGIS
+            if hasattr(self, 'progress') and hasattr(self, 'status'):
+                progresso_atual = 50 + int((idx + 1) / total_segmentos * 50)
+                self.progress.emit(progresso_atual)
+                self.status.emit(f"Exportando e georreferenciando: {idx + 1}/{total_segmentos}")
 
         # =====================================================================
         # CARREGAMENTO INTELIGENTE E SEGURO NO QGIS 4 (FALLBACK DE FORMATOS)
